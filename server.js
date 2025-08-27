@@ -1,63 +1,73 @@
+// server.js (ESM)
+// Dépendances: npm i express cors
 import express from "express";
 import cors from "cors";
 import { randomUUID } from "crypto";
 
-// ---------- Config ----------
+// --------- Config ---------
 const PORT = process.env.PORT || 8080;
 
-// Liste de worldIds autorisés (CSV). Vide = tout autoriser.
+// CSV de worldIds autorisés. Laisser vide => tout autoriser.
 const ALLOWED_WORLD_IDS = (process.env.ALLOWED_WORLD_IDS || "")
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
-const MAX_LEN = parseInt(process.env.MAX_LEN || "200", 10);        // longueur max d'un message
-const COOLDOWN_MS = parseInt(process.env.COOLDOWN_MS || "2000", 10); // 1 msg / 2s par IP
-const DEFAULT_LIMIT = parseInt(process.env.DEFAULT_LIMIT || "100", 10); // nombre max de msgs renvoyés
+const MAX_LEN       = parseInt(process.env.MAX_LEN       || "200", 10);  // len max d'un message
+const COOLDOWN_MS   = parseInt(process.env.COOLDOWN_MS   || "2000", 10); // 1 msg / 2s par IP
+const DEFAULT_LIMIT = parseInt(process.env.DEFAULT_LIMIT || "100", 10);  // taille page
 
-// ---------- App ----------
+// --------- App ---------
 const app = express();
-app.set("trust proxy", true); // utile derrière Railway/Cloudflare
+app.set("trust proxy", true);
 app.use(express.json({ limit: "32kb" }));
 app.use(cors({ origin: true }));
 
+// No-cache utilitaire
 function setNoCache(res) {
   res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.set("Pragma", "no-cache");
   res.set("Expires", "0");
 }
 
-// ---------- Stockage (mémoire) ----------
+// Servir /public (optionnel : pour send.html)
+app.use(
+  express.static("public", {
+    setHeaders: setNoCache,
+  })
+);
+
+// --------- Stockage (mémoire) ---------
+// ⚠️ Remplacez par une DB si besoin de persistance.
 let AUTO_ID = 0;
 const MESSAGES = []; // { id, uuid, worldId, channel, username, text, timestamp }
-const lastSentByIP = new Map(); // anti-spam simple
+const lastSentByIP = new Map(); // anti-spam par IP
 
 const nowISO = () => new Date().toISOString();
 const toIntOrDefault = (v, d) => {
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : d;
 };
-const clientIP = req =>
+const clientIP = (req) =>
   (req.headers["x-forwarded-for"]?.toString().split(",")[0].trim()) ||
   req.ip ||
   req.socket.remoteAddress ||
   "ip:unknown";
 
-// ---------- Routes ----------
+// --------- Routes ---------
 
 // Santé
 app.get("/", (_req, res) => {
   res.type("text/plain").send("GlobalChat backend OK");
 });
 
-// Envoi (GET-only pour compat Udon): /send?worldId=...&channel=global&username=Hyroe&text=Hello
+// Envoi (GET-only pour compat Udon):
+// /send?worldId=...&channel=global&username=Hyroe&text=Hello%20world
 app.get("/send", (req, res) => {
   const ip = clientIP(req);
   const last = lastSentByIP.get(ip) || 0;
   const now = Date.now();
-  if (now - last < COOLDOWN_MS) {
-    return res.status(429).json({ ok: false, error: "rate-limit" });
-  }
+  if (now - last < COOLDOWN_MS) return res.status(429).json({ ok: false, error: "rate-limit" });
 
   let { worldId, channel = "global", username = "Guest", text = "" } = req.query;
   worldId = (worldId || "").toString().trim();
@@ -66,9 +76,8 @@ app.get("/send", (req, res) => {
   text = (text || "").toString();
 
   if (!worldId) return res.status(400).json({ ok: false, error: "worldId-required" });
-  if (ALLOWED_WORLD_IDS.length && !ALLOWED_WORLD_IDS.includes(worldId)) {
+  if (ALLOWED_WORLD_IDS.length && !ALLOWED_WORLD_IDS.includes(worldId))
     return res.status(403).json({ ok: false, error: "worldId-forbidden" });
-  }
 
   const trimmed = text.trim();
   if (!trimmed) return res.status(400).json({ ok: false, error: "empty" });
@@ -81,7 +90,7 @@ app.get("/send", (req, res) => {
     channel,
     username: username.slice(0, 24),
     text: trimmed,
-    timestamp: nowISO()
+    timestamp: nowISO(),
   };
 
   MESSAGES.push(msg);
@@ -89,7 +98,8 @@ app.get("/send", (req, res) => {
   return res.json({ ok: true, id: msg.id, timestamp: msg.timestamp });
 });
 
-// Poll incrémental: /messages?since=123&limit=100&worldId=...&channel=global
+// Poll incrémental (cursor since):
+// /messages?since=0&limit=100&worldId=...&channel=global
 app.get("/messages", (req, res) => {
   let { worldId = "", channel = "", since = "0", limit } = req.query;
   worldId = worldId.toString().trim();
@@ -98,10 +108,10 @@ app.get("/messages", (req, res) => {
   const lim = Math.max(1, Math.min(200, toIntOrDefault(limit, DEFAULT_LIMIT)));
 
   let out = MESSAGES;
-  if (ALLOWED_WORLD_IDS.length && worldId) out = out.filter(m => m.worldId === worldId);
-  if (channel) out = out.filter(m => m.channel === channel);
+  if (ALLOWED_WORLD_IDS.length && worldId) out = out.filter((m) => m.worldId === worldId);
+  if (channel) out = out.filter((m) => m.channel === channel);
 
-  out = out.filter(m => m.id > sinceId).sort((a, b) => a.id - b.id);
+  out = out.filter((m) => m.id > sinceId).sort((a, b) => a.id - b.id);
 
   const slice = out.slice(0, lim);
   const cursor = slice.length ? String(slice[slice.length - 1].id) : String(sinceId);
@@ -109,18 +119,19 @@ app.get("/messages", (req, res) => {
   setNoCache(res);
   return res.json({
     cursor,
-    messages: slice.map(m => ({
+    messages: slice.map((m) => ({
       id: m.id,
       worldId: m.worldId,
       channel: m.channel,
       username: m.username,
       text: m.text,
-      timestamp: m.timestamp
-    }))
+      timestamp: m.timestamp,
+    })),
   });
 });
 
-// Flux fixe (idéal pour un VRCUrl constant): /messages.json?limit=100[&worldId=...&channel=...]
+// Flux fixe pour VRCUrl constant (lecture seule):
+// /messages.json?limit=100[&worldId=...&channel=...]
 app.get("/messages.json", (req, res) => {
   let { worldId = "", channel = "", limit } = req.query;
   worldId = worldId.toString().trim();
@@ -128,21 +139,21 @@ app.get("/messages.json", (req, res) => {
   const lim = Math.max(1, Math.min(200, toIntOrDefault(limit, DEFAULT_LIMIT)));
 
   let out = MESSAGES;
-  if (ALLOWED_WORLD_IDS.length && worldId) out = out.filter(m => m.worldId === worldId);
-  if (channel) out = out.filter(m => m.channel === channel);
+  if (ALLOWED_WORLD_IDS.length && worldId) out = out.filter((m) => m.worldId === worldId);
+  if (channel) out = out.filter((m) => m.channel === channel);
 
   const slice = out.slice(-lim); // N derniers
   setNoCache(res);
   return res.json({
-    messages: slice.map(m => ({
+    messages: slice.map((m) => ({
       username: m.username,
       text: m.text,
-      timestamp: m.timestamp
-    }))
+      timestamp: m.timestamp,
+    })),
   });
 });
 
-// ---------- Start ----------
+// --------- Start ---------
 app.listen(PORT, () => {
   console.log(`GlobalChat API listening on :${PORT}`);
 });
