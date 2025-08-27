@@ -1,0 +1,14 @@
+{
+  "name": "vrchat-globalchat",
+  "version": "1.0.0",
+  "description": "Backend pour un chat global entre instances VRChat",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  },
+  "type": "module"
+}
