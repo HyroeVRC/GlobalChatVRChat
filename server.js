@@ -1,10 +1,6 @@
-// server.js
-// Minimal backend pour chat global inter-instances VRChat (GET-only).
-// Dépendances: express, cors  ->  npm i express cors
-
-const express = require("express");
-const cors = require("cors");
-const { randomUUID } = require("crypto");
+import express from "express";
+import cors from "cors";
+import { randomUUID } from "crypto";
 
 // ---------- Config ----------
 const PORT = process.env.PORT || 8080;
@@ -15,17 +11,16 @@ const ALLOWED_WORLD_IDS = (process.env.ALLOWED_WORLD_IDS || "")
   .map(s => s.trim())
   .filter(Boolean);
 
-const MAX_LEN = parseInt(process.env.MAX_LEN || "200", 10);     // longueur max d'un message
+const MAX_LEN = parseInt(process.env.MAX_LEN || "200", 10);        // longueur max d'un message
 const COOLDOWN_MS = parseInt(process.env.COOLDOWN_MS || "2000", 10); // 1 msg / 2s par IP
 const DEFAULT_LIMIT = parseInt(process.env.DEFAULT_LIMIT || "100", 10); // nombre max de msgs renvoyés
 
 // ---------- App ----------
 const app = express();
-app.set("trust proxy", true); // pour récupérer l'IP réelle derrière un proxy
+app.set("trust proxy", true); // utile derrière Railway/Cloudflare
 app.use(express.json({ limit: "32kb" }));
 app.use(cors({ origin: true }));
 
-// No-cache headers pour les flux JSON
 function setNoCache(res) {
   res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.set("Pragma", "no-cache");
@@ -33,23 +28,20 @@ function setNoCache(res) {
 }
 
 // ---------- Stockage (mémoire) ----------
-// ⚠️ En prod, remplacez par une DB (SQLite/Postgres). La mémoire est éphémère (Railway/Render).
 let AUTO_ID = 0;
 const MESSAGES = []; // { id, uuid, worldId, channel, username, text, timestamp }
+const lastSentByIP = new Map(); // anti-spam simple
 
-// Anti-spam simple par IP
-const lastSentByIP = new Map();
-
-// Utils
-function nowISO() { return new Date().toISOString(); }
-function toIntOrDefault(v, d) {
+const nowISO = () => new Date().toISOString();
+const toIntOrDefault = (v, d) => {
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : d;
-}
-function clientIP(req) {
-  return (req.headers["x-forwarded-for"]?.toString().split(",")[0].trim())
-    || req.ip || req.socket.remoteAddress || "ip:unknown";
-}
+};
+const clientIP = req =>
+  (req.headers["x-forwarded-for"]?.toString().split(",")[0].trim()) ||
+  req.ip ||
+  req.socket.remoteAddress ||
+  "ip:unknown";
 
 // ---------- Routes ----------
 
@@ -58,8 +50,7 @@ app.get("/", (_req, res) => {
   res.type("text/plain").send("GlobalChat backend OK");
 });
 
-// Ajout d’un message (GET-only pour compat Udon):
-// /send?worldId=...&channel=global&username=Hyroe&text=Hello%20world
+// Envoi (GET-only pour compat Udon): /send?worldId=...&channel=global&username=Hyroe&text=Hello
 app.get("/send", (req, res) => {
   const ip = clientIP(req);
   const last = lastSentByIP.get(ip) || 0;
@@ -84,8 +75,8 @@ app.get("/send", (req, res) => {
   if (trimmed.length > MAX_LEN) return res.status(400).json({ ok: false, error: "too-long" });
 
   const msg = {
-    id: ++AUTO_ID,            // entier croissant (sert de curseur 'since')
-    uuid: randomUUID(),       // facultatif, utile en logs
+    id: ++AUTO_ID,
+    uuid: randomUUID(),
     worldId,
     channel,
     username: username.slice(0, 24),
@@ -98,8 +89,7 @@ app.get("/send", (req, res) => {
   return res.json({ ok: true, id: msg.id, timestamp: msg.timestamp });
 });
 
-// Poll incrémental des messages (filtrable par worldId/channel):
-// /messages?since=123&limit=100&worldId=...&channel=global
+// Poll incrémental: /messages?since=123&limit=100&worldId=...&channel=global
 app.get("/messages", (req, res) => {
   let { worldId = "", channel = "", since = "0", limit } = req.query;
   worldId = worldId.toString().trim();
@@ -108,13 +98,8 @@ app.get("/messages", (req, res) => {
   const lim = Math.max(1, Math.min(200, toIntOrDefault(limit, DEFAULT_LIMIT)));
 
   let out = MESSAGES;
-
-  if (ALLOWED_WORLD_IDS.length && worldId) {
-    out = out.filter(m => m.worldId === worldId);
-  }
-  if (channel) {
-    out = out.filter(m => m.channel === channel);
-  }
+  if (ALLOWED_WORLD_IDS.length && worldId) out = out.filter(m => m.worldId === worldId);
+  if (channel) out = out.filter(m => m.channel === channel);
 
   out = out.filter(m => m.id > sinceId).sort((a, b) => a.id - b.id);
 
@@ -135,8 +120,7 @@ app.get("/messages", (req, res) => {
   });
 });
 
-// Flux fixe (idéal pour un VRCUrl constant en lecture seule):
-// /messages.json?limit=100   (optionnel: &worldId=...&channel=...)
+// Flux fixe (idéal pour un VRCUrl constant): /messages.json?limit=100[&worldId=...&channel=...]
 app.get("/messages.json", (req, res) => {
   let { worldId = "", channel = "", limit } = req.query;
   worldId = worldId.toString().trim();
@@ -144,12 +128,8 @@ app.get("/messages.json", (req, res) => {
   const lim = Math.max(1, Math.min(200, toIntOrDefault(limit, DEFAULT_LIMIT)));
 
   let out = MESSAGES;
-  if (ALLOWED_WORLD_IDS.length && worldId) {
-    out = out.filter(m => m.worldId === worldId);
-  }
-  if (channel) {
-    out = out.filter(m => m.channel === channel);
-  }
+  if (ALLOWED_WORLD_IDS.length && worldId) out = out.filter(m => m.worldId === worldId);
+  if (channel) out = out.filter(m => m.channel === channel);
 
   const slice = out.slice(-lim); // N derniers
   setNoCache(res);
