@@ -1,14 +1,14 @@
 {
-  "name": "vrchat-globalchat",
+  "name": "vrchat-globalchat-backend",
   "version": "1.0.0",
-  "description": "Backend pour un chat global entre instances VRChat",
+  "description": "Backend minimal pour chat global inter-instances VRChat (GET-only pour Udon).",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5"
-  },
-  "type": "module"
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
 }
