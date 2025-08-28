@@ -18,9 +18,10 @@ const ALLOWED_WORLD_IDS = (process.env.ALLOWED_WORLD_IDS || "")
   .filter(Boolean);
 
 // Limites et anti-spam
-const MAX_LEN       = parseInt(process.env.MAX_LEN       || "200", 10);  // len max d'un message
-const COOLDOWN_MS   = parseInt(process.env.COOLDOWN_MS   || "2000", 10); // 1 msg / 2s par IP
-const DEFAULT_LIMIT = parseInt(process.env.DEFAULT_LIMIT || "100", 10);  // taille page
+const MAX_LEN       = parseInt(process.env.MAX_LEN       || "200", 10);   // len max d'un message
+const COOLDOWN_MS   = parseInt(process.env.COOLDOWN_MS   || "2000", 10);  // 1 msg / 2s par IP
+const DEFAULT_LIMIT = parseInt(process.env.DEFAULT_LIMIT || "100", 10);   // taille page
+const MAX_MESSAGES  = parseInt(process.env.MAX_MESSAGES  || "10000", 10); // backlog en mémoire
 
 // JSON store local par défaut (si doc non fourni)
 const DEFAULT_JSON_STORE_FILE =
@@ -37,25 +38,22 @@ const GITHUB_PUSH_ENABLED = (process.env.GITHUB_PUSH_ENABLED ?? "1") !== "0";
 
 // =================== APP ===================
 const app = express();
-app.set("trust proxy", true);
+// IMPORTANT: ajuste selon ta chaîne de proxies (1 si un seul proxy de confiance)
+app.set("trust proxy", 1);
+
 app.use(express.json({ limit: "32kb" }));
 app.use(cors({ origin: true }));
 
-// Logs simples (méthode, path, query)
+// Logger sûr (pas de query / Authorization / cookies)
 app.use((req, _res, next) => {
   console.log(
-    `[${new Date().toISOString()}] ${req.method} ${req.path} ${JSON.stringify(
-      req.query
-    )}`
+    `[${new Date().toISOString()}] ${req.method} ${req.path} ip=${clientIP(req)}`
   );
   next();
 });
 
 function setNoCache(res) {
-  res.set(
-    "Cache-Control",
-    "no-store, no-cache, must-revalidate, proxy-revalidate"
-  );
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.set("Pragma", "no-cache");
   res.set("Expires", "0");
 }
@@ -80,7 +78,6 @@ function ensureDirFor(file) {
 }
 
 function fileForDoc(doc) {
-  // doc=store => data/store.json ; sinon fichier par défaut
   const safe = (doc || "").toString().trim();
   if (!safe) return DEFAULT_JSON_STORE_FILE;
   return path.join("data", `${safe}.json`);
@@ -96,15 +93,6 @@ function loadStore(file) {
     console.error("Store load error:", e);
   }
   return {}; // défaut vide
-}
-
-function saveStoreSync(file, obj) {
-  try {
-    ensureDirFor(file);
-    fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf-8");
-  } catch (e) {
-    console.error("Store save error:", e);
-  }
 }
 
 // Accès via chemin "a.b.c"
@@ -130,7 +118,18 @@ function setByPath(obj, pathStr, val) {
   o[keys[keys.length - 1]] = val;
 }
 
-// =================== GITHUB PUSH ===================
+// ---- Auth helpers (Bearer ou ?token=) ----
+function readToken(req) {
+  const auth = req.headers.authorization || "";
+  if (auth.startsWith("Bearer ")) return auth.slice(7).trim();
+  return (req.query.token || req.body?.token || "").toString().trim();
+}
+function requireWriteAuth(req) {
+  if (!WRITE_TOKEN) return true;
+  return readToken(req) === WRITE_TOKEN;
+}
+
+// =================== GITHUB PUSH (async + queue) ===================
 async function githubFetchJson(url, init = {}) {
   const headers = init.headers || {};
   const res = await fetch(url, {
@@ -144,15 +143,21 @@ async function githubFetchJson(url, init = {}) {
   const json = await res.json().catch(() => ({}));
   return { ok: res.ok, status: res.status, json };
 }
+
+const writeQueues = new Map();
+function enqueueWrite(file, fn) {
+  let q = writeQueues.get(file) || Promise.resolve();
+  q = q.then(fn).catch((e) => console.error(e));
+  writeQueues.set(file, q);
+  return q;
+}
+
 async function pushToGithub(storeFile, message = "Update via API") {
   if (!GITHUB_TOKEN || !GITHUB_REPO || !GITHUB_PUSH_ENABLED)
     return { skipped: true };
 
   try {
-    // Chemin relatif repo
-    const relFile = path
-      .relative(process.cwd(), storeFile)
-      .replace(/\\/g, "/");
+    const relFile = path.relative(process.cwd(), storeFile).replace(/\\/g, "/");
 
     // SHA existante
     const getUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${encodeURIComponent(
@@ -168,9 +173,7 @@ async function pushToGithub(storeFile, message = "Update via API") {
     const newContentB64 = Buffer.from(content).toString("base64");
 
     // PUT create/update
-    const putUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${encodeURIComponent(
-      relFile
-    )}`;
+    const putUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${encodeURIComponent(relFile)}`;
     const body = {
       message,
       content: newContentB64,
@@ -183,23 +186,23 @@ async function pushToGithub(storeFile, message = "Update via API") {
       body: JSON.stringify(body),
     });
     if (!putRes.ok) {
-      console.error(
-        "GitHub PUT error:",
-        putRes.status,
-        putRes.json?.message,
-        putRes.json
-      );
-      return {
-        ok: false,
-        status: putRes.status,
-        error: putRes.json?.message || "github-put-failed",
-      };
+      console.error("GitHub PUT error:", putRes.status, putRes.json?.message, putRes.json);
+      return { ok: false, status: putRes.status, error: putRes.json?.message || "github-put-failed" };
     }
     return { ok: true, commit: putRes.json?.commit };
   } catch (e) {
     console.error("GitHub push exception:", e);
     return { ok: false, error: String(e) };
   }
+}
+
+async function writeDoc(file, store, message) {
+  ensureDirFor(file);
+  await enqueueWrite(file, async () => {
+    await fs.promises.writeFile(file, JSON.stringify(store, null, 2), "utf-8");
+    await pushToGithub(file, message);
+  });
+  return { ok: true };
 }
 
 // =================== ÉTAT EN MÉMOIRE (chat + register) ===================
@@ -226,8 +229,7 @@ app.get("/send", (req, res) => {
   if (now - last < COOLDOWN_MS)
     return res.status(429).json({ ok: false, error: "rate-limit" });
 
-  let { worldId, channel = "global", username = "Guest", text = "" } =
-    req.query;
+  let { worldId, channel = "global", username = "Guest", text = "" } = req.query;
   worldId = (worldId || "").toString().trim();
   channel = (channel || "global").toString().trim();
   username = (username || "Guest").toString().trim();
@@ -253,6 +255,9 @@ app.get("/send", (req, res) => {
   };
 
   MESSAGES.push(msg);
+  if (MESSAGES.length > MAX_MESSAGES) {
+    MESSAGES.splice(0, MESSAGES.length - MAX_MESSAGES);
+  }
   lastSentByIP.set(ip, now);
   return res.json({ ok: true, id: msg.id, timestamp: msg.timestamp });
 });
@@ -265,9 +270,14 @@ app.get("/messages", (req, res) => {
   const lim = Math.max(1, Math.min(200, toIntOrDefault(limit, DEFAULT_LIMIT)));
 
   let out = MESSAGES;
-  if (ALLOWED_WORLD_IDS.length && worldId)
-    out = out.filter((m) => m.worldId === worldId);
+
+  // Si une whitelist est définie, on limite toujours à ces mondes
+  if (ALLOWED_WORLD_IDS.length) {
+    out = out.filter((m) => ALLOWED_WORLD_IDS.includes(m.worldId));
+  }
+  if (worldId) out = out.filter((m) => m.worldId === worldId);
   if (channel) out = out.filter((m) => m.channel === channel);
+
   out = out.filter((m) => m.id > sinceId).sort((a, b) => a.id - b.id);
 
   const slice = out.slice(0, lim);
@@ -296,8 +306,10 @@ app.get("/messages.json", (req, res) => {
   const lim = Math.max(1, Math.min(200, toIntOrDefault(limit, DEFAULT_LIMIT)));
 
   let out = MESSAGES;
-  if (ALLOWED_WORLD_IDS.length && worldId)
-    out = out.filter((m) => m.worldId === worldId);
+  if (ALLOWED_WORLD_IDS.length) {
+    out = out.filter((m) => ALLOWED_WORLD_IDS.includes(m.worldId));
+  }
+  if (worldId) out = out.filter((m) => m.worldId === worldId);
   if (channel) out = out.filter((m) => m.channel === channel);
 
   const slice = out.slice(-lim);
@@ -311,19 +323,15 @@ app.get("/messages.json", (req, res) => {
   });
 });
 
-// -------- JSON STORE: multi-doc + GET-only friendly --------
+// -------- JSON STORE: multi-doc + GET/POST --------
 
 // util pour charger/écrire par "doc"
 function readDoc(doc) {
   const file = fileForDoc(doc);
   return { file, store: loadStore(file) };
 }
-async function writeDoc(file, store, message) {
-  saveStoreSync(file, store);
-  return pushToGithub(file, message);
-}
 
-// Lecture générique: /json/get?doc=store&path=players.Hyroe.playMs
+// Lecture générique: /json/get?doc=store&path=players.Hyroe.playSec
 app.get("/json/get", (req, res) => {
   const doc = (req.query.doc || "").toString().trim();
   const p = (req.query.path || "").toString().trim();
@@ -335,61 +343,143 @@ app.get("/json/get", (req, res) => {
   return res.json({ ok: true, doc: doc || "default", path: p, value });
 });
 
-// Écriture générique GET-only:
-// /json/set?token=...&doc=store&path=players.Hyroe.playMs&value=123
-// /json/set?token=...&doc=store&path=players.Hyroe&valueJson={"playMs":123}
-app.get("/json/set", async (req, res) => {
+// Ecriture générique: GET (compat) et POST (recommandé)
+// /json/set?token=...&doc=store&path=players.Hyroe.playSec&value=123
+// /json/set (POST) body: { token?, doc, path, value? | valueJson? }
+async function handleJsonSet(req, res) {
   const ip = clientIP(req);
   const last = lastSentByIP.get(ip) || 0;
   const now = Date.now();
   if (now - last < COOLDOWN_MS)
     return res.status(429).json({ ok: false, error: "rate-limit" });
 
-  if (WRITE_TOKEN) {
-    const token = (req.query.token || "").toString().trim();
-    if (token !== WRITE_TOKEN)
-      return res.status(403).json({ ok: false, error: "invalid-token" });
-  }
+  if (!requireWriteAuth(req))
+    return res.status(403).json({ ok: false, error: "invalid-token" });
 
-  const doc = (req.query.doc || "").toString().trim();
-  const p = (req.query.path || "").toString().trim();
+  const doc = ((req.method === "POST" ? req.body.doc : req.query.doc) || "").toString().trim();
+  const p = ((req.method === "POST" ? req.body.path : req.query.path) || "").toString().trim();
   if (!p) return res.status(400).json({ ok: false, error: "path-required" });
 
   let value;
-  if (typeof req.query.valueJson !== "undefined") {
+  const vj = req.method === "POST" ? req.body.valueJson : req.query.valueJson;
+  if (typeof vj !== "undefined") {
     try {
-      value = JSON.parse(req.query.valueJson.toString());
+      value = typeof vj === "string" ? JSON.parse(vj) : vj;
     } catch {
       return res.status(400).json({ ok: false, error: "invalid-valueJson" });
     }
   } else {
-    value = (req.query.value || "").toString();
+    value = (req.method === "POST" ? req.body.value : req.query.value) ?? "";
+    value = value.toString();
     if (/^-?\d+$/.test(value)) value = Number(value);
   }
 
   const { file, store } = readDoc(doc);
   try {
     setByPath(store, p, value);
-    const message = `Update ${path
-      .relative(process.cwd(), file)
-      .replace(/\\/g, "/")} (${p})`;
+    const message = `Update ${path.relative(process.cwd(), file).replace(/\\/g, "/")} (${p})`;
     await writeDoc(file, store, message);
     lastSentByIP.set(ip, now);
     return res.json({
-      ok: true,
-      doc: doc || "default",
-      path: p,
-      value,
-      timestamp: nowISO(),
+      ok: true, doc: doc || "default", path: p, value, timestamp: nowISO(),
     });
   } catch (e) {
     return res.status(400).json({ ok: false, error: e.message || "set-failed" });
   }
+}
+app.get("/json/set", handleJsonSet);
+app.post("/json/set", handleJsonSet);
+
+// -------- Shortcuts Udon-friendly (Sec = secondes) --------
+
+// GET total en secondes: /json/getTotalSec?doc=store&player=Hyroe
+app.get("/json/getTotalSec", (req, res) => {
+  const doc = (req.query.doc || "").toString().trim();
+  const player = (req.query.player || "").toString().trim();
+  if (!player)
+    return res.status(400).json({ ok: false, error: "player-required" });
+
+  const { store } = readDoc(doc);
+  const value = getByPath(store, `players.${player}.playSec`) || 0;
+  setNoCache(res);
+  return res.json({ ok: true, player, sec: Number(value) || 0 });
 });
 
-// Raccourcis Udon-friendly : éviter de construire path côté client
+// SET total en secondes (GET compat & POST recommandé)
+// GET: /json/setTotalSec?token=...&doc=store&player=Hyroe&sec=123456
+// POST body: { token?, doc, player, sec }
+async function handleSetTotalSec(req, res) {
+  if (!requireWriteAuth(req))
+    return res.status(403).json({ ok: false, error: "invalid-token" });
 
-// GET total: /json/getTotal?doc=store&player=Hyroe
+  const doc = ((req.method === "POST" ? req.body.doc : req.query.doc) || "").toString().trim();
+  const player = ((req.method === "POST" ? req.body.player : req.query.player) || "").toString().trim();
+  const secRaw = (req.method === "POST" ? req.body.sec : req.query.sec);
+  const sec = Number((secRaw ?? "0").toString().trim());
+
+  if (!player) return res.status(400).json({ ok: false, error: "player-required" });
+  if (!Number.isFinite(sec) || sec < 0)
+    return res.status(400).json({ ok: false, error: "invalid-sec" });
+
+  const { file, store } = readDoc(doc);
+  setByPath(store, `players.${player}.playSec`, sec);
+  const message = `setTotalSec ${player}=${sec}`;
+  await writeDoc(file, store, message);
+  return res.json({ ok: true, player, sec });
+}
+app.get("/json/setTotalSec", handleSetTotalSec);
+app.post("/json/setTotalSec", handleSetTotalSec);
+
+// -------- Association IP → player + Pulse tolérant --------
+
+// Enregistre l'association IP -> pseudo (GET/POST)
+async function handleRegister(req, res) {
+  const tokenOK = requireWriteAuth(req);
+  if (!tokenOK) return res.status(403).json({ ok: false, error: "invalid-token" });
+
+  const ip = clientIP(req);
+  const doc = ((req.method === "POST" ? req.body.doc : req.query.doc) || "store").toString().trim();
+  const player = ((req.method === "POST" ? req.body.player : req.query.player) || "ClientSim").toString().trim();
+
+  ipToPlayer.set(ip, player);
+  return res.json({ ok: true, ip, player, doc });
+}
+app.get("/json/register", handleRegister);
+app.post("/json/register", handleRegister);
+
+// PULSE en secondes, tolérant (aucun player= requis)
+// GET:  /json/pulseSec?token=...&doc=store&addSec=60[&player=Hyroe]
+// POST: /json/pulseSec  body { token?, doc, addSec, player? }
+async function handlePulseSec(req, res) {
+  if (!requireWriteAuth(req))
+    return res.status(403).json({ ok: false, error: "invalid-token" });
+
+  const ip = clientIP(req);
+  const doc = ((req.method === "POST" ? req.body.doc : req.query.doc) || "store").toString().trim();
+  const add = (req.method === "POST" ? req.body.addSec : req.query.addSec) ?? "60";
+  let player = ((req.method === "POST" ? req.body.player : req.query.player) || "").toString().trim();
+
+  const addSec = Number(add);
+  if (!Number.isFinite(addSec) || addSec <= 0)
+    return res.status(400).json({ ok: false, error: "invalid-addSec" });
+
+  if (!player) player = ipToPlayer.get(ip) || "ClientSim";
+
+  const { file, store } = readDoc(doc);
+  const cur = Number(getByPath(store, `players.${player}.playSec`) || 0);
+  const next = cur + addSec;
+
+  setByPath(store, `players.${player}.playSec`, next);
+  const message = `pulseSec ${player} += ${addSec} -> ${next}`;
+  await writeDoc(file, store, message);
+
+  return res.json({ ok: true, doc, player, addedSec: addSec, sec: next });
+}
+app.get("/json/pulseSec", handlePulseSec);
+app.post("/json/pulseSec", handlePulseSec);
+
+// ------ (Compat hérité en millisecondes) ------
+// GET total ms (hérité)
 app.get("/json/getTotal", (req, res) => {
   const doc = (req.query.doc || "").toString().trim();
   const player = (req.query.player || "").toString().trim();
@@ -402,18 +492,15 @@ app.get("/json/getTotal", (req, res) => {
   return res.json({ ok: true, player, ms: Number(value) || 0 });
 });
 
-// SET total: /json/setTotal?token=...&doc=store&player=Hyroe&ms=1234567
+// SET total ms (hérité)
 app.get("/json/setTotal", async (req, res) => {
-  if (WRITE_TOKEN) {
-    const token = (req.query.token || "").toString().trim();
-    if (token !== WRITE_TOKEN)
-      return res.status(403).json({ ok: false, error: "invalid-token" });
-  }
+  if (!requireWriteAuth(req))
+    return res.status(403).json({ ok: false, error: "invalid-token" });
+
   const doc = (req.query.doc || "").toString().trim();
   const player = (req.query.player || "").toString().trim();
   const ms = Number((req.query.ms || "0").toString().trim());
-  if (!player)
-    return res.status(400).json({ ok: false, error: "player-required" });
+  if (!player) return res.status(400).json({ ok: false, error: "player-required" });
   if (!Number.isFinite(ms) || ms < 0)
     return res.status(400).json({ ok: false, error: "invalid-ms" });
 
@@ -424,69 +511,19 @@ app.get("/json/setTotal", async (req, res) => {
   return res.json({ ok: true, player, ms });
 });
 
-// -------- Association IP → player + Pulse tolérant --------
-
-// Enregistre l'association IP -> pseudo (à faire une fois par utilisateur)
-// /json/register?token=...&doc=store&player=Hyroe
-app.get("/json/register", (req, res) => {
-  const ip = clientIP(req);
-  const token = (req.query.token || "").toString().trim();
-  const doc = (req.query.doc || "store").toString().trim();
-  const player = (req.query.player || "ClientSim").toString().trim();
-
-  if (WRITE_TOKEN && token !== WRITE_TOKEN)
-    return res.status(403).json({ ok: false, error: "invalid-token" });
-
-  ipToPlayer.set(ip, player);
-  return res.json({ ok: true, ip, player, doc });
-});
-
-// PULSE tolérant (aucun player= requis). Optionnellement, si player= fourni, il est utilisé.
-// /json/pulse?token=...&doc=store&addMs=60000[&player=Hyroe]
-app.get("/json/pulse", async (req, res) => {
-  const ip = clientIP(req);
-  const token = (req.query.token || "").toString().trim();
-  const doc = (req.query.doc || "store").toString().trim();
-  const addMs = Number((req.query.addMs || "60000").toString().trim());
-  let player = (req.query.player || "").toString().trim();
-
-  if (WRITE_TOKEN && token !== WRITE_TOKEN)
-    return res.status(403).json({ ok: false, error: "invalid-token" });
-  if (!Number.isFinite(addMs) || addMs <= 0)
-    return res.status(400).json({ ok: false, error: "invalid-addMs" });
-
-  if (!player) player = ipToPlayer.get(ip) || "ClientSim";
-
-  const { file, store } = readDoc(doc);
-  const cur = Number(getByPath(store, `players.${player}.playMs`) || 0);
-  const next = cur + addMs;
-
-  setByPath(store, `players.${player}.playMs`, next);
-  const message = `pulse ${player} += ${addMs} -> ${next}`;
-  await writeDoc(file, store, message);
-
-  return res.json({ ok: true, doc, player, added: addMs, ms: next });
-});
-
-// Wildcard “not found” → toujours JSON (évite les 404 HTML)
+// Wildcard “not found” → toujours JSON
 app.use((req, res) => {
-  res
-    .status(404)
-    .json({ ok: false, error: "not-found", path: req.path, query: req.query });
+  res.status(404).json({ ok: false, error: "not-found", path: req.path, query: req.query });
 });
 
 // =================== START ===================
 app.listen(PORT, () => {
   console.log(`GlobalChat API listening on :${PORT}`);
   console.log(`Default JSON store: ${DEFAULT_JSON_STORE_FILE}`);
-  if (WRITE_TOKEN) console.log("JSON write token enabled");
+  if (WRITE_TOKEN) console.log("JSON write token enabled (use Bearer or ?token=)");
   if (GITHUB_TOKEN && GITHUB_REPO) {
-    console.log(
-      `GitHub push enabled=${GITHUB_PUSH_ENABLED} repo=${GITHUB_REPO} branch=${GITHUB_BRANCH}`
-    );
+    console.log(`GitHub push enabled=${GITHUB_PUSH_ENABLED} repo=${GITHUB_REPO} branch=${GITHUB_BRANCH}`);
   } else {
-    console.log(
-      "GitHub push disabled (set GITHUB_TOKEN & GITHUB_REPO to enable)"
-    );
+    console.log("GitHub push disabled (set GITHUB_TOKEN & GITHUB_REPO to enable)");
   }
 });
