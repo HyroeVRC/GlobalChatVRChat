@@ -380,18 +380,35 @@ app.use((req, res) => {
   res.status(404).json({ ok: false, error: "not-found", path: req.path, query: req.query });
 });
 // Ping/pulse: enregistre simplement le temps total du joueur
-app.get("/json/pulse", (req, res) => {
-  const { name = "Unknown", playMs = "0" } = req.query;
-
-  try {
-    setByPath(STORE, `players.${name}.playMs`, parseInt(playMs, 10));
-    saveStoreDebounced();
-
-    return res.json({ ok: true, name, playMs });
-  } catch (e) {
-    return res.status(400).json({ ok: false, error: e.message });
+app.get("/json/pulse", async (req, res) => {
+  // Token optionnel
+  const token = (req.query.token || "").toString().trim();
+  if (process.env.JSON_WRITE_TOKEN && token !== process.env.JSON_WRITE_TOKEN) {
+    return res.status(403).json({ ok: false, error: "invalid-token" });
   }
+
+  const doc    = (req.query.doc || "store").toString().trim();          // défaut "store"
+  const player = (req.query.player || "ClientSim").toString().trim();   // défaut "ClientSim"
+  const addMs  = Number((req.query.addMs || "60000").toString().trim());// défaut 60s
+
+  if (!Number.isFinite(addMs) || addMs <= 0) {
+    return res.status(400).json({ ok: false, error: "invalid-addMs" });
+  }
+
+  const file  = fileForDoc(doc);
+  const store = loadStore(file);
+  const cur   = Number(getByPath(store, `players.${player}.playMs`) || 0);
+  const next  = cur + addMs;
+
+  setByPath(store, `players.${player}.playMs`, next);
+  saveStoreSync(file, store);
+
+  // (optionnel) commit GitHub si activé
+  const github = await pushToGithub(file, `pulse ${player} += ${addMs} -> ${next}`);
+
+  return res.json({ ok: true, doc, player, ms: next, added: addMs, github });
 });
+
 
 // =================== START ===================
 app.listen(PORT, () => {
