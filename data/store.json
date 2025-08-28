@@ -3,6 +3,10 @@
     "Hyroe": {
       "score": 42,
       "online": true
+    },
+    "Alice": {
+      "score": 10,
+      "online": false
     }
   },
   "worlds": {
