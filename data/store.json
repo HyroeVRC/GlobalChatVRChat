@@ -8,6 +8,9 @@
     },
     "Bob": {
       "playMs": 54321
+    },
+    "ClientSim": {
+      "playMs": 8000
     }
   }
 }
