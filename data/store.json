@@ -10,7 +10,7 @@
       "playMs": 54321
     },
     "ClientSim": {
-      "playMs": 2000
+      "playMs": 3000
     }
   }
 }
