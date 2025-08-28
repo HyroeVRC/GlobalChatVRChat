@@ -379,6 +379,19 @@ app.get("/json/pulse", async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: "not-found", path: req.path, query: req.query });
 });
+// Ping/pulse: enregistre simplement le temps total du joueur
+app.get("/json/pulse", (req, res) => {
+  const { name = "Unknown", playMs = "0" } = req.query;
+
+  try {
+    setByPath(STORE, `players.${name}.playMs`, parseInt(playMs, 10));
+    saveStoreDebounced();
+
+    return res.json({ ok: true, name, playMs });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: e.message });
+  }
+});
 
 // =================== START ===================
 app.listen(PORT, () => {
