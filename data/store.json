@@ -1,1 +1,13 @@
-Hey hey
+{
+  "players": {
+    "Hyroe": {
+      "playMs": 1234567
+    },
+    "Alice": {
+      "playMs": 98765
+    },
+    "Bob": {
+      "playMs": 54321
+    }
+  }
+}
