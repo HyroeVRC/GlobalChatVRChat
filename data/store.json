@@ -1,0 +1,13 @@
+{
+  "players": {
+    "Hyroe": {
+      "score": 42,
+      "online": true
+    }
+  },
+  "worlds": {
+    "testWorld": {
+      "counter": 5
+    }
+  }
+}

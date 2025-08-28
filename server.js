@@ -1,27 +1,40 @@
 // server.js (ESM)
+// Node >= 18 (fetch natif)
+// Dépendances: npm i express cors
+
 import express from "express";
 import cors from "cors";
 import { randomUUID } from "crypto";
-// ==== JSON STORE (ajouts)
 import fs from "fs";
 import path from "path";
 
-// --------- Config ---------
+// =================== CONFIG ===================
 const PORT = process.env.PORT || 8080;
 
 // CSV de worldIds autorisés. Laisser vide => tout autoriser.
 const ALLOWED_WORLD_IDS = (process.env.ALLOWED_WORLD_IDS || "")
   .split(",").map((s) => s.trim()).filter(Boolean);
 
-const MAX_LEN       = parseInt(process.env.MAX_LEN       || "200", 10);
-const COOLDOWN_MS   = parseInt(process.env.COOLDOWN_MS   || "2000", 10);
-const DEFAULT_LIMIT = parseInt(process.env.DEFAULT_LIMIT || "100", 10);
+// Limites et anti-spam
+const MAX_LEN       = parseInt(process.env.MAX_LEN       || "200", 10);  // len max d'un message
+const COOLDOWN_MS   = parseInt(process.env.COOLDOWN_MS   || "2000", 10); // 1 msg / 2s par IP
+const DEFAULT_LIMIT = parseInt(process.env.DEFAULT_LIMIT || "100", 10);  // taille page
 
-// ==== JSON STORE (config de sécurité)
+// JSON store local
 const JSON_STORE_FILE = process.env.JSON_STORE_FILE || path.join("data", "store.json");
-const WRITE_TOKEN     = process.env.JSON_WRITE_TOKEN || ""; // si vide => pas d’auth (déconseillé)
+// Auth facultative pour /json/set
+const WRITE_TOKEN     = process.env.JSON_WRITE_TOKEN || "";
 
-// --------- App ---------
+// Push GitHub (facultatif) — si GITHUB_TOKEN et GITHUB_REPO sont définis, on commit à chaque /json/set
+// Exemple: GITHUB_REPO="Hyroe/vrchat-globalchat", GITHUB_FILE="data/store.json", GITHUB_BRANCH="main"
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
+const GITHUB_REPO  = process.env.GITHUB_REPO  || "";
+const GITHUB_FILE  = process.env.GITHUB_FILE  || "data/store.json";
+const GITHUB_BRANCH= process.env.GITHUB_BRANCH|| "main";
+// Mettre à "0" pour désactiver même si token présent
+const GITHUB_PUSH_ENABLED = (process.env.GITHUB_PUSH_ENABLED ?? "1") !== "0";
+
+// =================== APP ===================
 const app = express();
 app.set("trust proxy", true);
 app.use(express.json({ limit: "32kb" }));
@@ -35,7 +48,7 @@ function setNoCache(res) {
 
 app.use(express.static("public", { setHeaders: setNoCache }));
 
-// --------- Stockage (mémoire) ---------
+// =================== ÉTAT EN MÉMOIRE ===================
 let AUTO_ID = 0;
 const MESSAGES = []; // { id, uuid, worldId, channel, username, text, timestamp }
 const lastSentByIP = new Map();
@@ -49,7 +62,7 @@ const clientIP = (req) =>
   (req.headers["x-forwarded-for"]?.toString().split(",")[0].trim()) ||
   req.ip || req.socket.remoteAddress || "ip:unknown";
 
-// ==== JSON STORE (helpers)
+// =================== JSON STORE (local + helpers) ===================
 function ensureDirFor(file) {
   const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -60,8 +73,10 @@ function loadStore() {
       const raw = fs.readFileSync(JSON_STORE_FILE, "utf-8");
       return JSON.parse(raw);
     }
-  } catch (e) { console.error("Store load error:", e); }
-  return {}; // défaut
+  } catch (e) {
+    console.error("Store load error:", e);
+  }
+  return {}; // défaut vide
 }
 let STORE = loadStore();
 
@@ -74,10 +89,10 @@ function saveStoreDebounced() {
       fs.writeFileSync(JSON_STORE_FILE, JSON.stringify(STORE, null, 2), "utf-8");
     } catch (e) { console.error("Store save error:", e); }
     pendingSave = null;
-  }, 200); // petit debounce
+  }, 200);
 }
 
-// Accès par chemin "a.b.c"
+// Accès via chemin "a.b.c"
 function getByPath(obj, pathStr) {
   if (!pathStr) return obj;
   return pathStr.split(".").reduce((o, k) => (o && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined), obj);
@@ -94,12 +109,75 @@ function setByPath(obj, pathStr, val) {
   o[keys[keys.length - 1]] = val;
 }
 
-// --------- Routes ---------
+// =================== GITHUB (commit de store.json) ===================
+// Utilise l'API GitHub: https://docs.github.com/en/rest/repos/contents#update-or-create-file-contents
+async function githubFetchJson(url, init = {}) {
+  const headers = init.headers || {};
+  const res = await fetch(url, {
+    ...init,
+    headers: {
+      "Authorization": `Bearer ${GITHUB_TOKEN}`,
+      "Accept": "application/vnd.github+json",
+      ...headers,
+    },
+  });
+  const json = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, json };
+}
+
+async function saveStoreToGithub(pathChanged) {
+  if (!GITHUB_TOKEN || !GITHUB_REPO || !GITHUB_PUSH_ENABLED) return { skipped: true };
+
+  try {
+    // 1) Récupérer la SHA actuelle (si le fichier existe)
+    const getUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${encodeURIComponent(GITHUB_FILE)}?ref=${encodeURIComponent(GITHUB_BRANCH)}`;
+    const getRes = await githubFetchJson(getUrl, { method: "GET" });
+
+    let sha = undefined;
+    if (getRes.ok && getRes.json && getRes.json.sha) {
+      sha = getRes.json.sha;
+    } else if (getRes.status !== 404) {
+      // Si autre erreur que "not found"
+      console.warn("GitHub GET warning:", getRes.status, getRes.json?.message);
+    }
+
+    // 2) Contenu à pousser (base64)
+    const newContentB64 = Buffer.from(JSON.stringify(STORE, null, 2)).toString("base64");
+
+    // 3) PUT (create or update)
+    const putUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${encodeURIComponent(GITHUB_FILE)}`;
+    const body = {
+      message: `Update ${GITHUB_FILE} via /json/set (${pathChanged})`,
+      content: newContentB64,
+      branch: GITHUB_BRANCH,
+      ...(sha ? { sha } : {}),
+    };
+    const putRes = await githubFetchJson(putUrl, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!putRes.ok) {
+      console.error("GitHub PUT error:", putRes.status, putRes.json?.message, putRes.json);
+      return { ok: false, status: putRes.status, error: putRes.json?.message || "github-put-failed" };
+    }
+
+    return { ok: true, content: putRes.json?.content, commit: putRes.json?.commit };
+  } catch (e) {
+    console.error("GitHub push exception:", e);
+    return { ok: false, error: String(e) };
+  }
+}
+
+// =================== ROUTES ===================
+
+// Santé
 app.get("/", (_req, res) => {
   res.type("text/plain").send("GlobalChat backend OK");
 });
 
-// Envoi (GET-only pour compat Udon)
+// Envoi (GET-only pour compat Udon): /send?worldId=...&channel=global&username=Hyroe&text=Hello
 app.get("/send", (req, res) => {
   const ip = clientIP(req);
   const last = lastSentByIP.get(ip) || 0;
@@ -135,7 +213,7 @@ app.get("/send", (req, res) => {
   return res.json({ ok: true, id: msg.id, timestamp: msg.timestamp });
 });
 
-// Poll incrémental
+// Poll incrémental (cursor since): /messages?since=0&limit=100&worldId=...&channel=global
 app.get("/messages", (req, res) => {
   let { worldId = "", channel = "", since = "0", limit } = req.query;
   worldId = worldId.toString().trim();
@@ -161,7 +239,7 @@ app.get("/messages", (req, res) => {
   });
 });
 
-// Flux fixe (lecture seule)
+// Flux fixe (lecture seule): /messages.json?limit=100[&worldId=...&channel=...]
 app.get("/messages.json", (req, res) => {
   let { worldId = "", channel = "", limit } = req.query;
   worldId = worldId.toString().trim();
@@ -181,7 +259,7 @@ app.get("/messages.json", (req, res) => {
   });
 });
 
-// ==== JSON STORE: GET/SET depuis VRChat ============================
+// ===== JSON STORE: GET/SET (compatible VRCStringDownloader) =====
 
 // Lecture: /json/get?path=worlds.myWorld.counter
 app.get("/json/get", (req, res) => {
@@ -191,14 +269,13 @@ app.get("/json/get", (req, res) => {
   return res.json({ ok: true, path: p || "", value });
 });
 
-// Écriture GET-only :
+// Écriture GET-only (URL-params):
 // /json/set?path=worlds.myWorld.counter&value=42
 // /json/set?path=players.Hyroe&valueJson={"score":12,"online":true}
 // + sécurité optionnelle:
 //   - ?token=SECRET
-//   - ?worldId=... (contrainte sur ALLOWED_WORLD_IDS si renseigné)
-app.get("/json/set", (req, res) => {
-  // Anti-spam simple par IP (réutilise le cooldown global)
+//   - ?worldId=... (contraint si ALLOWED_WORLD_IDS est renseigné)
+app.get("/json/set", async (req, res) => {
   const ip = clientIP(req);
   const last = lastSentByIP.get(ip) || 0;
   const now = Date.now();
@@ -221,14 +298,12 @@ app.get("/json/set", (req, res) => {
   const p = (req.query.path || "").toString().trim();
   if (!p) return res.status(400).json({ ok: false, error: "path-required" });
 
-  // value ou valueJson
   const hasValueJson = typeof req.query.valueJson !== "undefined";
   let value;
   if (hasValueJson) {
     try { value = JSON.parse(req.query.valueJson); }
     catch { return res.status(400).json({ ok: false, error: "invalid-valueJson" }); }
   } else {
-    // valeur texte brute
     value = (req.query.value || "").toString();
   }
 
@@ -236,15 +311,71 @@ app.get("/json/set", (req, res) => {
     setByPath(STORE, p, value);
     saveStoreDebounced();
     lastSentByIP.set(ip, now);
-    return res.json({ ok: true, path: p, value, timestamp: nowISO() });
+
+    // Push GitHub (optionnel)
+    let github = { skipped: true };
+    if (GITHUB_TOKEN && GITHUB_REPO && GITHUB_PUSH_ENABLED) {
+      github = await saveStoreToGithub(p);
+    }
+
+    return res.json({
+      ok: true,
+      path: p,
+      value,
+      timestamp: nowISO(),
+      github,
+    });
   } catch (e) {
     return res.status(400).json({ ok: false, error: e.message || "set-failed" });
   }
 });
 
-// --------- Start ---------
+// (facultatif) Incrément atomique: /json/inc?path=counter&by=1
+app.get("/json/inc", async (req, res) => {
+  const ip = clientIP(req);
+  const last = lastSentByIP.get(ip) || 0;
+  const now = Date.now();
+  if (now - last < COOLDOWN_MS) return res.status(429).json({ ok: false, error: "rate-limit" });
+
+  const token = (req.query.token || "").toString().trim();
+  if (WRITE_TOKEN && token !== WRITE_TOKEN) return res.status(403).json({ ok: false, error: "invalid-token" });
+
+  let { worldId = "", path: p = "", by = "1" } = req.query;
+  worldId = worldId.toString().trim();
+  if (!p) return res.status(400).json({ ok: false, error: "path-required" });
+  if (ALLOWED_WORLD_IDS.length && worldId && !ALLOWED_WORLD_IDS.includes(worldId))
+    return res.status(403).json({ ok: false, error: "worldId-forbidden" });
+
+  const delta = Number(by);
+  if (!Number.isFinite(delta)) return res.status(400).json({ ok: false, error: "invalid-by" });
+
+  const cur = Number(getByPath(STORE, p)) || 0;
+  const val = cur + delta;
+
+  try {
+    setByPath(STORE, p, val);
+    saveStoreDebounced();
+    lastSentByIP.set(ip, now);
+
+    let github = { skipped: true };
+    if (GITHUB_TOKEN && GITHUB_REPO && GITHUB_PUSH_ENABLED) {
+      github = await saveStoreToGithub(p);
+    }
+
+    return res.json({ ok: true, path: p, value: val, timestamp: nowISO(), github });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: e.message || "inc-failed" });
+  }
+});
+
+// =================== START ===================
 app.listen(PORT, () => {
   console.log(`GlobalChat API listening on :${PORT}`);
   console.log(`JSON store file: ${JSON_STORE_FILE}`);
   if (WRITE_TOKEN) console.log("JSON write token enabled");
+  if (GITHUB_TOKEN && GITHUB_REPO) {
+    console.log(`GitHub push enabled=${GITHUB_PUSH_ENABLED} repo=${GITHUB_REPO} file=${GITHUB_FILE} branch=${GITHUB_BRANCH}`);
+  } else {
+    console.log("GitHub push disabled (set GITHUB_TOKEN & GITHUB_REPO to enable)");
+  }
 });
